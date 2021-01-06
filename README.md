@@ -1,7 +1,4 @@
-# diffTF
-Quantification of Differential Transcription Factor Activity and Multiomics-Based Classification into Activators and Repressors: diffTF
-
-
+![logo|small](https://git.embl.de/grp-zaugg/diffTF/-/raw/master/docs/Figures/diffTF_graphicalAbstract.jpg)
 
 Quantification of Differential Transcription Factor Activity and Multiomics-Based Classification into Activators and Repressors: diffTF       
 =========================================================================================================================================
