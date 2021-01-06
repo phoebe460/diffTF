@@ -1,0 +1,696 @@
+############################################
+# Libraries, versions, authors and license #
+############################################
+
+from snakemake.utils import min_version
+import subprocess
+import os
+import pandas
+import numpy
+import socket
+import time
+
+start = time.time()
+
+
+# Enforce a minimum Snakemake version because of various features
+min_version("5.3.1")
+
+__author__  = "Christian Arnold & Ivan Berest"
+__license__ = "MIT"
+
+
+#############
+# FUNCTIONS #
+#############
+
+
+# The onsuccess handler is executed if the workflow finished without error.
+onsuccess:
+    print("\n\n#################################\n#  Workflow finished, no error  #")
+    print(                                       "# Check the FINAL_OUTPUT folder #\n#################################\n\n")
+    print("\nRunning time in minutes: %s\n" % round((time.time() - start)/60,1))
+# Else, the onerror handler is executed.
+onerror:
+    print("\n\n#####################\n# An error occurred #\n#####################\n\n")
+    print("\nRunning time in minutes: %s\n" % round((time.time() - start)/60,1))
+    #shell("mail -s "an error occurred" carnold@embl.de < {log}")
+
+# onstart handler will be executed before the workflow starts. Note that dry-runs do not trigger any of the handlers
+onstart:
+    print("Reading samples and metadata....\n")
+    print ("Running workflow for the following " + str(len(allTF)) + " TF:\n " + ' \n '.join(map(str, allTF)))
+    print ("Running workflow for the following BAM files:\n " + ' \n '.join(map(str, allBamFiles)))
+
+
+
+def read_samplesTable(samplesSummaryFile, consensusPeaks):
+    """text"""
+
+    # Deprecated: data = pandas.read_table(samplesSummaryFile)
+    data = pandas.read_csv(samplesSummaryFile, sep = "\t")
+
+    # Expect a particular number of columns, do a sanity check here
+
+    if not consensusPeaks:
+
+        if not {'SampleID', 'bamReads', 'conditionSummary', 'Peaks'}.issubset(data.columns.values):
+            raise KeyError("The samples file must contain at least the following named columns (TAB separated!): 'SampleID', 'bamReads', 'conditionSummary', 'Peaks'")
+
+    else:
+
+        if not {'SampleID', 'bamReads', 'conditionSummary'}.issubset(data.columns.values):
+            raise KeyError("The samples file must contain at least the following named columns (TAB separated!): 'SampleID', 'bamReads', 'conditionSummary'")
+
+    return data
+
+# https://stackoverflow.com/questions/26560726/python-binomial-coefficient
+def fcomb0(n, k):
+    '''
+    Compute the number of ways to choose k elements out of a pile of n.
+
+    Use an iterative approach with the multiplicative formula:
+    \frac{n!}{k!(n - k)!} =
+    \frac{n(n - 1)\dots(n - k + 1)}{k(k-1)\dots(1)} =
+    \prod{i = 1}{k}\frac{n + 1 - i}{i}
+
+    Also rely on the symmetry: C_n^k = C_n^{n - k}, so the product can
+    be calculated up to min(k, n - k)
+
+    :param n: the size of the pile of elements
+    :param k: the number of elements to take from the pile
+    :return: the number of ways to choose k elements out of a pile of n
+    '''
+
+    # When k out of sensible range, should probably throw an exception.
+    # For compatibility with scipy.special.{comb, binom} returns 0 instead.
+    if k < 0 or k > n:
+        return 0
+
+    if k == 0 or k == n:
+        return 1
+
+    total_ways = 1
+    for i in range(min(k, n - k)):
+        total_ways = total_ways * (n - i) // (i + 1)
+
+    return total_ways
+
+###############################################
+# Check if all parameters have been specified #
+###############################################
+
+configDict = {
+            "par_general":
+                ["outdir", "regionExtension", "comparisonType", "designContrast", "designVariableTypes", "conditionComparison", "nPermutations", "nCGBins", "TFs", "dir_scripts", "RNASeqIntegration", "nBootstraps"],
+            "samples":
+                ["summaryFile", "pairedEnd"],
+            "peaks":
+                ["consensusPeaks", "peakType", "minOverlap"],
+            "additionalInputFiles":
+                ["refGenome_fasta","dir_TFBS", "RNASeqCounts", "HOCOMOCO_mapping"]
+            }
+
+for sectionCur in configDict:
+
+    # 1. Section is defined at all?
+    if not sectionCur in config:
+        raise KeyError("Could not find section \"" + sectionCur + "\" in the config file or no config file has been specified.")
+
+    # 2. All section parameters are defined?
+    requiredPar = configDict[sectionCur]
+    missingParameters = []
+
+    for parCur in requiredPar:
+        if not parCur in config[sectionCur]:
+            missingParameters.append(parCur)
+
+    if len(missingParameters) > 0:
+        missingParStr = ",".join(missingParameters)
+        raise KeyError("Could not find parameter(s) \"" + missingParStr + "\" in section \"" + sectionCur + "\" in the config file.")
+
+
+#############################
+# DIRECTORIES AND VARIABLES #
+#############################
+
+# Maximum number of cores per rule.
+# For local computation, the minimum of this value and the --cores parameter will define the number of CPUs per rule,
+# while in a cluster setting, the minimum of this value and the number of cores onn the node the jobs runs is usedself.
+
+try:
+  threadsMax = config["par_general"]["maxCoresPerRule"]
+except KeyError:
+  print("The parameter \"coresPerRule\" in section \"par_general\" has not been defined. Jobs/rules with multithreading support will use the default of 4 cores.")
+  threadsMax = 4
+
+try:
+  debugMode = config["par_general"]["debugMode"]
+except KeyError:
+  print("The parameter \"debugMode\" in section \"par_general\" has not been defined. The debug mode will not be available unless you add the parameter in the config file and set it to \"True\".")
+  debugMode = False
+
+
+
+
+# This has been disabled to catch reported edge cases from version 1.2.5 onwards
+# try:
+#   TFBSSorted = config["par_general"]["dir_TFBS_sorted"]
+# except KeyError:
+#   TFBSSorted = False
+
+# Changed from version 1.2.5 onwards
+TFBSSorted = False
+
+# Increase ulimit -n for analysis with high number of TF and/or input files. The standard value of 1024 may not be enough.
+ulimitMax = 4096
+
+# Suffix name for the TFBS lists
+suffixTFBS = '_TFBS.bed'
+
+# Make the output nicer and easier to follow
+ruleDisplayMessage = "\n# START EXECUTING RULE #\n"
+
+# Input files
+samplesSummaryFile = config["samples"]["summaryFile"]
+regionExt          = config["par_general"]["regionExtension"]
+nCGBins            = config["par_general"]["nCGBins"]
+extDir = "extension" + str(config["par_general"]["regionExtension"])
+
+pairedEndOptions = "-p -B -P -d 0 -D 2000 -C"
+if not config["samples"]["pairedEnd"]:
+    pairedEndOptions = ""
+
+ROOT_DIR            = config["par_general"]["outdir"]
+FINAL_DIR           = ROOT_DIR + "/FINAL_OUTPUT/" + extDir
+TF_DIR              = ROOT_DIR + "/TF-SPECIFIC"
+PEAKS_DIR           = ROOT_DIR + "/PEAKS"
+LOG_BENCHMARK_DIR   = ROOT_DIR + "/LOGS_AND_BENCHMARKS"
+TEMP_DIR            = ROOT_DIR + "/TEMP"
+TEMP_EXTENSION_DIR  = ROOT_DIR + "/TEMP/"  + extDir
+TEMP_BAM_DIR        = ROOT_DIR + "/TEMP/"  + "sortedBAM"
+
+
+global samplesData
+samplesData = read_samplesTable(config["samples"]["summaryFile"], config["peaks"]["consensusPeaks"])
+
+allBamFiles  = samplesData.loc[:,"bamReads"]
+
+if config["par_general"]["comparisonType"] != "":
+    compType = config["par_general"]["comparisonType"] + "."
+else:
+    compType = ""
+
+############################
+# CHECK EXISTANCE OF FILES #
+############################
+
+allBamFilesBasename = []
+for fileCur in allBamFiles:
+    if not os.path.isfile(fileCur):
+        raise IOError("File \"" + fileCur + "\" (defined in " + config["samples"]["summaryFile"] + ") not found.")
+    # Index is not needed for featureCounts
+    basename = os.path.splitext(os.path.basename(fileCur))[0]
+    allBamFilesBasename.append(basename)
+
+# Add new column
+samplesData = samplesData.assign(basename = allBamFilesBasename)
+
+# Check existance of all specified peak files
+if not config["peaks"]["consensusPeaks"]:
+    allPeakFiles = samplesData.loc[:,"Peaks"]
+    for fileCur in allPeakFiles:
+        if not os.path.isfile(fileCur):
+            raise IOError("File \"" + fileCur + "\" (defined in " + config["samples"]["summaryFile"] +  ") not found.")
+else:
+    allPeakFiles = []
+
+
+allTF = []
+
+if config["par_general"]["TFs"] == "all":
+    TFBS_FILES = os.popen("ls " + config["additionalInputFiles"]["dir_TFBS"]).readlines()
+    for TFCur in TFBS_FILES:
+        if not os.path.basename(TFCur.replace('\n', '')).endswith(suffixTFBS):
+            continue
+        TFCurBasename = os.path.basename(TFCur.replace('\n', '').replace(suffixTFBS, ''))
+        allTF.append(TFCurBasename)
+else:
+    TFArray = config["par_general"]["TFs"].replace(" ", "").split(',')
+    for TFCur in TFArray:
+        fileCur = config["additionalInputFiles"]["dir_TFBS"] + "/" + TFCur + suffixTFBS
+        if not os.path.isfile(fileCur):
+            raise IOError("The TF " + TFCur + " is in the list of TFs to process, but the file \"" + fileCur + "\" is missing. Check the folder " + config["additionalInputFiles"]["dir_TFBS"] + " and \"par_general\": \"TFs\")")
+        allTF.append(TFCur)
+
+if len(allTF) == 0:
+    raise WorkflowError("The list of TFs is empty. Adjust the parameter \"par_general\": \"TFs\" and verify that in the specified folder \"" + config["additionalInputFiles"]["dir_TFBS"] + "\", files with the pattern \"{TF}_TFBS.bed\" are present")
+
+
+if not os.path.isfile(config["additionalInputFiles"]["refGenome_fasta"]):
+    raise IOError("File \"" + config["additionalInputFiles"]["refGenome_fasta"] + "\" not found (parameter additionalInputFiles:refGenome_fasta).")
+
+if config["par_general"]["RNASeqIntegration"]:
+
+    filenameCur = config["additionalInputFiles"]["HOCOMOCO_mapping"]
+    if not os.path.isfile(filenameCur):
+        raise IOError("File \"" + filenameCur + "\" not found (parameter additionalInputFiles:HOCOMOCO_mapping).")
+
+    filenameCur = config["additionalInputFiles"]["RNASeqCounts"]
+    if not os.path.isfile(filenameCur):
+        raise IOError("File \"" + filenameCur + "\" not found (parameter additionalInputFiles:RNASeqCounts).")
+
+
+if config["peaks"]["consensusPeaks"]:
+    filenameCur = config["peaks"]["consensusPeaks"]
+    if not os.path.isfile(filenameCur):
+        raise IOError("File \"" + filenameCur + "\" not found.")
+    # Check if it contains scientific notification
+    # the || true in the end ensures the exit status of grep is 0, because this would raise an error otherwise
+    nHits = int(subprocess.check_output('grep -c "e+" ' + config["peaks"]["consensusPeaks"] + " || true", shell=True))
+    if nHits > 0:
+        raise AssertionError("File " + config["peaks"]["consensusPeaks"] + " contains at least one line with the scientific notation (e+). This will cause errors in subsequent steps. Check the file and transform all \"e+\" coordinates.")
+
+################
+# PERMUTATIONS #
+################
+
+# Adjust the number of permutations if set to high
+nSamples = len(samplesData.index)
+nSamplesCondition1 = len(samplesData[(samplesData['conditionSummary'] == samplesData['conditionSummary'][0])])
+nPermutationsTotal = fcomb0(nSamples, nSamplesCondition1)
+if nPermutationsTotal < config["par_general"]["nPermutations"]:
+    nPermutationsAdjusted = nPermutationsTotal
+else:
+    nPermutationsAdjusted = config["par_general"]["nPermutations"]
+
+if config["par_general"]["nPermutations"] == 0 and config["par_general"]["nBootstraps"] == 0:
+  raise AssertionError("Both nPermutations and nBootstraps are set to 0 in the config file. Either of the two has to have a value > 0. We recommend running diffTF with as many permutations as possible. See the documentation for details.")
+
+
+###########
+# SCRIPTS #
+###########
+
+# Default directory for R scripts, specified relative to the Snakefile
+# Not to be confused with the dir_scripts directory, which is only used to load the correct functions.R file in all R scripts
+dir_scripts = "R/"
+
+script_checkParValidity     = "checkParameterValidity.R"
+script_createConsensusPeaks = "createConsensusPeaks.R"
+script_DiffPeaks            = "diffPeaks.R"
+script_analyzeTF            = "analyzeTF.R"
+script_summary1             = "summary1.R"
+script_binningTF            = "binningTF.R"
+script_summaryFinal         = "summaryFinal.R"
+
+
+
+#########################################
+#########################################
+#              RULES                    #
+#########################################
+#########################################
+
+# For cluster usage:  The keyword localrules allows to mark a rule as local, so that it is not submitted to the cluster and instead executed on the host node
+localrules: all,cleanUpLogFiles,filterSexChromosomesAndSortPeaks
+
+rule all:
+    input:
+        plots       = expand("{dir}/{compType}summary.volcano.pdf", dir = FINAL_DIR, compType = compType),
+        summaryLogs = LOG_BENCHMARK_DIR + "/" + compType + "all.warnings.log"
+
+
+rule checkParameterValidity:
+    input:
+    output:
+        flag      = touch(TEMP_DIR  + "/" + compType + "checkParameterValidity.done"),
+        consPeaks = TEMP_DIR  + "/" + compType + "consensusPeaks.clean.bed",
+    log: expand('{dir}/checkParameterValidity.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Check parameter validity {script_checkParValidity}..."
+    threads: 1
+    priority: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    params: debugFile = LOG_BENCHMARK_DIR + "/checkParameterValidity.R.debug.RData",
+            suffixTFBS = suffixTFBS
+    script: dir_scripts + script_checkParValidity
+
+rule produceConsensusPeaks:
+    input:
+        checkFlag = ancient(rules.checkParameterValidity.output.flag),
+        peaks     = allPeakFiles
+    output:
+        consensusPeaks_bed = TEMP_DIR + "/" + compType + "consensusPeaks.bed",
+        summaryPlot        = TEMP_DIR + "/" + compType + "consensusPeaks_lengthDistribution.pdf"
+    log: expand('{dir}/produceConsensusPeaks.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Calculate consensus peaks for all peak files with the script {script_createConsensusPeaks}..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    params: debugFile = LOG_BENCHMARK_DIR + "/produceConsensusPeaks.R.debug.RData"
+    script: dir_scripts + script_createConsensusPeaks
+
+# Forces the execution of the rule above just when the user did not provide a consensus peak file
+def retrieveConsensusPeakFile (par_consensusPeaks):
+
+    if not par_consensusPeaks:
+        return rules.produceConsensusPeaks.output.consensusPeaks_bed
+    else:
+        return rules.checkParameterValidity.output.consPeaks
+
+# Sort the consensus peak file and only include "regular" chromosomes denoted with "chr"
+# that are neither sex chromosomes nor chrM
+rule filterSexChromosomesAndSortPeaks:
+    input:
+        consensusPeaks = retrieveConsensusPeakFile(config["peaks"]["consensusPeaks"])
+    output:
+        consensusPeaks_sorted   = PEAKS_DIR + "/" + compType + "consensusPeaks.filtered.sorted.bed"
+    message: "{ruleDisplayMessage}Filter sex and unassembled chromosomes..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    shell: """
+            grep ^chr {input.consensusPeaks} | grep -v "^chrX\|^chrY\|^chrM\|^chrUn"  | sort -k1,1 -k2,2n > {output.consensusPeaks_sorted}
+           """
+
+
+overlapPattern = "overlaps.bed.gz"
+
+rule sortTFBSParallel:
+    input:
+        flag = ancient(rules.checkParameterValidity.output.flag),
+        allBed = expand('{dir}/{TF}{suffix}', dir = config["additionalInputFiles"]["dir_TFBS"], TF = allTF, suffix = suffixTFBS)
+    output:
+        allBedSorted = expand('{dir}/{compType}{TF}_TFBS.sorted.bed', dir = TEMP_DIR, compType = compType, TF = allTF)
+    message: "{ruleDisplayMessage} Sort TFBS files for all TF..."
+    threads: 1
+    run:
+        for fi,fo in zip(input.allBed, output.allBedSorted):
+          shell("grep ^chr {fi} | grep -v \"^chrX\|^chrY\|^chrM\|^chrUn\" | sort -k1,1 -k2,2n > {fo}")
+
+
+def getBamFileFromBasename(basename):
+    """text"""
+    hit = numpy.asarray(samplesData.loc[samplesData["basename"] == basename, "bamReads"])
+    if len(hit) != 1:
+        raise KeyError("Could not uniquely retrieve the BAM file for the basename \"" + basename + "\" from the file " + config["samples"]["summaryFile"])
+    return hit
+
+# Not run for single-end data
+rule resortBAM:
+    input:
+        flag = ancient(rules.checkParameterValidity.output.flag),
+        BAM = lambda wildcards: getBamFileFromBasename(wildcards.BAM)
+    output:
+        BAMSorted = TEMP_BAM_DIR + "/" + "{BAM}.bam"
+    message: "{ruleDisplayMessage} Sort BAM file {input.BAM}..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        compression = "-c",
+        noSeqInf = "-t"
+    shell:
+        """repair {params.compression} {params.noSeqInf} -i {input.BAM} -o {output.BAMSorted}"""
+
+
+
+def getBamFilesBasedOnPairedEnd(wildcards):
+    """text"""
+    if config["samples"]["pairedEnd"]:
+        return expand('{dir}/{allBasenamesBAM}.bam', dir = TEMP_BAM_DIR, allBasenamesBAM = allBamFilesBasename)
+    else:
+        return allBamFiles
+
+
+# Use anonymous named pipe to speed-up execution times
+rule intersectPeaksAndBAM:
+    input:
+        consensusPeaks = rules.filterSexChromosomesAndSortPeaks.output.consensusPeaks_sorted,
+        allBAMs        = getBamFilesBasedOnPairedEnd
+    output:
+        peaksBamOverlapRaw = temp(PEAKS_DIR + '/' + compType + 'allBams.peaks.overlaps.bed'),
+        peaksBamOverlap    = PEAKS_DIR + '/' + compType + 'allBams.peaks.overlaps.bed.gz',
+        consensusPeaksSAF  = temp(TEMP_DIR + "/" + compType + "consensusPeaks.filtered.sorted.saf"),
+    log:
+    message: "{ruleDisplayMessage} Intersect for file {input.consensusPeaks} with all BAM files..."
+    threads: threadsMax
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        pairedEnd     = pairedEndOptions,
+        readFiltering = "-Q 10",
+        multiOverlap = "-O",
+        ulimitMax = ulimitMax
+    shell:
+        """ ulimit -n {params.ulimitMax}  &&
+            awk 'BEGIN {{ OFS = "\\t" }} {{print $4,$1,$2,$3,"+"}}' {input.consensusPeaks} >{output.consensusPeaksSAF} &&
+            featureCounts \
+            -F SAF \
+            -T {threads} \
+            {params.readFiltering} \
+            {params.pairedEnd} \
+            -s 0 \
+            {params.multiOverlap}  \
+            -a {output.consensusPeaksSAF} \
+            -o {output.peaksBamOverlapRaw}  \
+            {input.allBAMs} &&
+            gzip -f < {output.peaksBamOverlapRaw} > {output.peaksBamOverlap}
+        """
+
+# TF-specific part:
+
+# As of now, this is currently set to false in all cases to avoid potential issues with unassembled contigs
+def retrieveInputFilesTFBS (TFBSSorted):
+
+    if not TFBSSorted:
+        return rules.sortTFBSParallel.output.allBedSorted
+    else:
+        return expand('{dir}/{TF}{suffix}', dir = config["additionalInputFiles"]["dir_TFBS"], TF = allTF, suffix = suffixTFBS)
+
+rule intersectPeaksAndTFBS:
+    input:
+        consensusPeaks = rules.filterSexChromosomesAndSortPeaks.output.consensusPeaks_sorted,
+        allTFBS        = retrieveInputFilesTFBS(TFBSSorted)
+    output:
+        TFBSinPeaks_bed    = expand('{dir}/{compType}allTFBS.peaks.bed.gz', dir = TEMP_DIR, compType = compType),
+        TFBSinPeaksMod_bed = expand('{dir}/{compType}allTFBS.peaks.extension.bed.gz', dir = TEMP_EXTENSION_DIR, compType = compType)
+    message: "{ruleDisplayMessage} Obtain binding sites from peaks: Intersect all TFBS files and {input.consensusPeaks}..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        extension = config["par_general"]["regionExtension"],
+        ulimitMax = ulimitMax
+    shell:
+        """ ulimit -n {params.ulimitMax} &&
+            bedtools intersect \
+                -a {input.consensusPeaks} \
+                -b {input.allTFBS} \
+                -wa -wb \
+                -sorted \
+                -filenames \
+                | gzip -f > {output.TFBSinPeaks_bed} &&
+            gunzip -c {output.TFBSinPeaks_bed} | cut -f4,5,6,7,8,9,12 | uniq  | awk '{{OFS="\\t"}};{{ print $4, $5-{params.extension}, $6+{params.extension},$1,$2,$7,$3}}' | gzip -f > {output.TFBSinPeaksMod_bed}
+        """
+
+
+rule intersectTFBSAndBAM:
+    input:
+        bed           = rules.intersectPeaksAndTFBS.output.TFBSinPeaksMod_bed,
+        allBAMs       = getBamFilesBasedOnPairedEnd
+    output:
+        BAMOverlapRaw = temp(TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}.allBAMs.overlaps.bed"),
+        BAMOverlap    =      TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}.allBAMs.overlaps.bed.gz",
+        saf           = temp(expand('{dir}/{compType}{{TF}}.allTFBS.peaks.extension.saf', dir = TEMP_EXTENSION_DIR, compType = compType))
+    log:
+    message: "{ruleDisplayMessage} Intersect file {input.bed} against all BAM files for TF {wildcards.TF}..."
+    threads: 4
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        pairedEnd = pairedEndOptions,
+        readFiltering = "-Q 10",
+        multiOverlap = "-O",
+        ulimitMax = ulimitMax
+    shell:
+        """ ulimit -n {params.ulimitMax} &&
+            zgrep "{wildcards.TF}_TFBS\." {input.bed} | awk 'BEGIN {{ OFS = "\\t" }} {{print $4"_"$2"-"$3,$1,$2,$3,$6}}' | sort -u -k1,1  >{output.saf} || true &&
+            if [[ $(wc -l <{output.saf}) -eq "0" ]]; then
+                touch {output.BAMOverlapRaw}
+                echo "No TFBS found, skip featureCounts..."
+            else
+                featureCounts \
+                -F SAF \
+                -T {threads} \
+                {params.readFiltering} \
+                {params.pairedEnd} \
+                -a {output.saf} \
+                -s 0 \
+                {params.multiOverlap}  \
+                -o {output.BAMOverlapRaw}  \
+                {input.allBAMs}
+            fi &&
+            gzip -f < {output.BAMOverlapRaw} > {output.BAMOverlap}
+
+        """
+
+
+name_plots = PEAKS_DIR + "/" + compType + "diagnosticPlots.peaks.pdf"
+
+rule DiffPeaks:
+    input:
+        sampleData      = config["samples"]["summaryFile"],
+        BAMPeakoverlaps = rules.intersectPeaksAndBAM.output.peaksBamOverlap
+    output:
+        sampleDataR    = PEAKS_DIR + "/" + compType + "sampleMetadata.rds",
+        peakFile       = PEAKS_DIR + "/" + compType + "peaks.rds",
+        peaks_tsv      = PEAKS_DIR + "/" + compType + "peaks.tsv.gz",
+        condComp       = TEMP_EXTENSION_DIR  + "/" + compType + "conditionComparison.rds",
+        normFacs       = PEAKS_DIR + "/" + compType + "normFacs.rds",
+        normCounts     = PEAKS_DIR + "/" + compType + "countsNormalized.tsv.gz",
+        plots          = name_plots,
+        DESeqObj       = PEAKS_DIR + "/" + compType + "DESeq.object.rds"
+    log: expand('{dir}/DiffPeaks.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Run R script {script_DiffPeaks}"
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    params:
+        doCyclicLoess = "true",
+        debugFile = LOG_BENCHMARK_DIR + "/DiffPeaks.R.debug.RData"
+    script: dir_scripts + script_DiffPeaks
+
+
+name_plotsDiag = TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}" + ".diagnosticPlots.pdf"
+
+rule analyzeTF:
+    input:
+        overlapFile        = rules.intersectTFBSAndBAM.output.BAMOverlap,
+        sampleDataR        = rules.DiffPeaks.output.sampleDataR,
+        peakFile           = rules.DiffPeaks.output.peakFile,
+        peakFile2          = rules.DiffPeaks.output.peaks_tsv,
+        normFacs           = rules.DiffPeaks.output.normFacs,
+        condComp           = rules.DiffPeaks.output.condComp
+    output:
+        outputTSV            = TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}.output.tsv.gz",
+        outputPermTSV        = TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}.outputPerm.tsv.gz",
+        outputRDS            = TF_DIR + "/{TF}/" + extDir + "/" + compType + "{TF}.summary.rds",
+        plot_diagnostic      = name_plotsDiag
+    log: expand('{dir}/analyzeTF.{{TF}}.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Run R script {script_analyzeTF} for TF {wildcards.TF}..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    params:
+        doCyclicLoess = "true",
+        allBAMS       = list(allBamFiles),
+        debugFile     = lambda wc: LOG_BENCHMARK_DIR + "/analyzeTF." + wc.TF + ".R.debug.RData"
+    script: dir_scripts + script_analyzeTF
+
+
+rule summary1:
+    input:
+        peaks = rules.DiffPeaks.output.peaks_tsv,
+        TF    = expand('{dir}/{TF}/{ext}/{compType}{TF}.summary.rds', dir = TF_DIR, TF = allTF, ext = extDir, compType = compType)
+    output:
+        outputTable = FINAL_DIR + "/" + compType + "TF_vs_peak_distribution.tsv.gz"
+    log: expand('{dir}/summary1.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Run R script {script_summary1} ..."
+    threads: 1
+    params: debugFile = LOG_BENCHMARK_DIR + "/summary1.R.debug.RData"
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    script: dir_scripts + script_summary1
+
+
+rule concatenateMotifsPerm:
+    input:
+        diagnosticPlots = rules.summary1.output,
+        TFMotifesPerm = expand('{dir}/{TF}/{extension}/{compType}{TF}.outputPerm.tsv.gz', dir = TF_DIR, TF = allTF, extension = extDir, compType = compType)
+    output:
+        allMotifsLog2FC  = temp(TEMP_EXTENSION_DIR + "/" + compType + "allMotifs_log2FC_perm{perm}.tsv.gz")
+    log:
+    message: "{ruleDisplayMessage}Concatenate all motifs for permutation {wildcards.perm}..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        motifsShortPerm = TF_DIR + "/*/" + extDir + "/" + compType + "*.outputPerm.tsv.gz",
+        colToExtract= lambda wc: str(int(wc.perm) + 3)
+    shell:
+      """
+        zcat {params.motifsShortPerm} | cut -f1,2,{params.colToExtract} | gzip >{output.allMotifsLog2FC}
+      """
+
+
+# set +o pipefail has to be used here because head closes the pipe after reading the specified number of lines, causing a 141 (127+14) error that Snakemake captures)
+# Use anonymous named pipe to speed-up execution times
+rule calcNucleotideContent:
+    input:
+        diagnosticPlots = rules.summary1.output,
+        TFMotifes     = expand('{dir}/{TF}/{extension}/{compType}{TF}.output.tsv.gz', dir = TF_DIR, TF = allTF, extension = extDir, compType = compType)
+    output:
+        allMotifsDetails = FINAL_DIR + "/" + compType + "allMotifs.tsv.gz",
+        bed     = TEMP_EXTENSION_DIR + "/" + compType + "motifs.coord.nucContent.bed.gz"
+    log:
+    message: "{ruleDisplayMessage}Calculate nucleotide content via bedtools nuc for all TFBS..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    params:
+        motifsShort = TF_DIR + "/*/" + extDir + "/" + compType + "*.output.tsv.gz",
+        refGenome = config["additionalInputFiles"]["refGenome_fasta"]
+    shell:
+      """
+            set +o pipefail; cat <(gunzip -c {input.TFMotifes[1]} | head -1) <(zgrep "$(printf '^0\\t')" {params.motifsShort}) | gzip -f > {output.allMotifsDetails} &&
+            bedtools nuc -fi {params.refGenome} -bed <(gunzip -c {output.allMotifsDetails} | awk '{{OFS="\\t"}}; NR > 1 {{print $3,$4,$5,$6,$2}}') | gzip -f > {output.bed}
+        """
+
+rule binningTF:
+    input:
+        nucContent  = rules.calcNucleotideContent.output.bed,
+        sampleDataR = rules.DiffPeaks.output.sampleDataR,
+        motifes     = expand("{dir}/{compType}allMotifs_log2FC_perm{perm}.tsv.gz", dir = TEMP_EXTENSION_DIR, compType = compType, perm = list(range(0, nPermutationsAdjusted + 1)))
+    output:
+        permResults  = expand('{dir}/{{TF}}/{extension}/{compType}{{TF}}.permutationResults.rds', dir = TF_DIR, extension = extDir, compType = compType),
+        summary      = expand('{dir}/{{TF}}/{extension}/{compType}{{TF}}.permutationSummary.tsv.gz', dir = TF_DIR, extension = extDir, compType = compType)
+    log: expand('{dir}/binningTF.{{TF}}.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Run R script {script_binningTF} for TF {wildcards.TF}..."
+    threads: 1
+    params: debugFile = lambda wc: LOG_BENCHMARK_DIR + "/binningTF." + wc.TF + ".R.debug.RData"
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    script: dir_scripts + script_binningTF
+
+# Determine which files are produced by the rule depending on whether the classifiation should be run
+allDiagnosticFiles = []
+allDiagnosticFiles.append(FINAL_DIR + "/" + compType + "diagnosticPlots.pdf")
+if config["par_general"]["RNASeqIntegration"]:
+    classificationFiles = expand("{dir}/{compType}diagnosticPlotsClassification{no}.pdf", dir = FINAL_DIR, compType = compType, no = [1,2])
+    allDiagnosticFiles.append(classificationFiles)
+
+
+rule summaryFinal:
+    input:
+        allPermutationResults = expand('{dir}/{TF}/{extension}/{compType}{TF}.permutationSummary.tsv.gz', dir = TF_DIR, TF = allTF, extension = extDir, compType = compType),
+        condComp              = rules.DiffPeaks.output.condComp,
+        normCounts            = rules.DiffPeaks.output.normCounts,
+        sampleDataR           = rules.DiffPeaks.output.sampleDataR,
+    output:
+        summary         = FINAL_DIR + "/" + compType + "summary.tsv.gz",
+        volcanoPlot     = FINAL_DIR + "/" + compType + "summary.volcano.pdf",
+        diagnosticPlots = allDiagnosticFiles,
+        plotsRDS        = FINAL_DIR + "/" + compType + "summary.plots.rds",
+    log: expand('{dir}/summaryFinal.R.log', dir = LOG_BENCHMARK_DIR)
+    message: "{ruleDisplayMessage}Run R script {script_summaryFinal} ..."
+    threads: 1
+    singularity: "shub://chrarnold/Singularity_images:difftf_r"
+    params: TFs       = ",".join(allTF),
+            debugFile = LOG_BENCHMARK_DIR + "/summaryFinal.R.debug.RData"
+    script: dir_scripts + script_summaryFinal
+
+
+rule cleanUpLogFiles:
+    input: rules.summaryFinal.output
+    output:
+        warnLog  = LOG_BENCHMARK_DIR + "/" + compType + "all.warnings.log",
+        errorLog = LOG_BENCHMARK_DIR + "/" + compType + "all.errors.log"
+    message: "{ruleDisplayMessage}Clean and summarize Logs_and_Benchmark directory..."
+    threads: 1
+    params: dir = LOG_BENCHMARK_DIR
+    singularity: "shub://chrarnold/Singularity_images:difftf_conda"
+    shell:
+      """
+        grep -i "^WARN"  {params.dir}/*.log > {output.warnLog} || true &&
+        grep -i "^FATAL" {params.dir}/*.log > {output.errorLog} || true &&
+        rm {params.dir}/*.out {params.dir}/*.err || true
+      """

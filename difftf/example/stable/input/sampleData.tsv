@@ -1,0 +1,9 @@
+SampleID	Condition	bamReads	Peaks	conditionSummary
+GMP.WT.1	GMP	data/bam/GMP.WT.1.chr1.bam	data/peaks/GMP.WT.1.narrowPeak	GMP
+GMP.WT.2	GMP	data/bam/GMP.WT.2.chr1.bam	data/peaks/GMP.WT.2.narrowPeak	GMP
+GMP.WT.3	GMP	data/bam/GMP.WT.3.chr1.bam	data/peaks/GMP.WT.3.narrowPeak	GMP
+GMP.WT.4	GMP	data/bam/GMP.WT.4.chr1.bam	data/peaks/GMP.WT.4.narrowPeak	GMP
+MPP.WT.1	MPP	data/bam/MPP.WT.1.chr1.bam	data/peaks/MPP.WT.1.narrowPeak	MPP
+MPP.WT.2	MPP	data/bam/MPP.WT.2.chr1.bam	data/peaks/MPP.WT.2.narrowPeak	MPP
+MPP.WT.3	MPP	data/bam/MPP.WT.3.chr1.bam	data/peaks/MPP.WT.3.narrowPeak	MPP
+MPP.WT.4	MPP	data/bam/MPP.WT.4.chr1.bam	data/peaks/MPP.WT.4.narrowPeak	MPP

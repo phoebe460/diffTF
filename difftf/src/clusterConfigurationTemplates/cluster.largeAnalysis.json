@@ -1,0 +1,71 @@
+{
+  "__default__": {
+    "queue": "htc",
+    "nCPUs": "{threads}",
+    "memory": 20000,
+    "maxTime": "5:00:00",
+    "name": "{rule}.{wildcards}",
+    "output": "{rule}.{wildcards}.out",
+    "error": "{rule}.{wildcards}.err"
+  },
+  "checkParameterValidity": {
+    "memory": 2000,
+    "maxTime": "1:00:00"
+  },
+  "produceConsensusPeaks": {
+    "memory": 2000,
+    "maxTime": "1:00:00"
+  },
+  "filterSexChromosomesAndSortPeaks": {
+    "memory": 2000,
+    "maxTime": "1:00:00"
+  },
+  "sortTFBSParallel": {
+    "memory": 2000,
+    "maxTime": "1:00:00"
+  },
+  "resortBAM": {
+    "memory": 10000,
+    "maxTime": "2:00:00"
+  },
+  "intersectPeaksAndPWM": {
+    "memory": 10000,
+    "maxTime": "2:00:00"
+  },
+  "intersectPeaksAndBAM": {
+    "memory": 10000,
+    "maxTime": "5:00:00"
+  },
+  "intersectTFBSAndBAM": {
+    "memory": 10000,
+    "maxTime": "5:00:00"
+  },
+  "DiffPeaks": {
+    "memory": 10000,
+    "maxTime": "5:00:00"
+  },
+  "analyzeTF": {
+    "memory": 15000,
+    "maxTime": "5:00:00"
+  },
+  "concatenateMotifsPerm": {
+    "memory": 2000,
+    "maxTime": "2:00:00"
+  },
+  "calcNucleotideContent": {
+    "memory": 2000,
+    "maxTime": "2:00:00"
+  },
+  "binningTF": {
+    "memory": 15000,
+    "maxTime": "15:00:00"
+  },
+  "summaryFinal": {
+    "memory": 10000,
+    "maxTime": "2:00:00"
+  },
+  "cleanUpLogFiles": {
+    "memory": 1000,
+    "maxTime": "0:30:00"
+  }
+}

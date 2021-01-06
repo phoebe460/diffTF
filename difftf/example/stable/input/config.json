@@ -1,0 +1,34 @@
+{
+  "par_general": {
+    "outdir": "../output",
+    "maxCoresPerRule": 2,
+    "dir_TFBS_sorted": false,
+    "regionExtension": 100,
+    "comparisonType": "GMPvsMPP.all",
+    "conditionComparison": "GMP,MPP",
+    "designContrast": "~ conditionSummary",
+    "designVariableTypes": "conditionSummary:factor",
+    "nPermutations": 100,
+    "nBootstraps": 0,
+    "nCGBins": 10,
+    "TFs": "CTCF,CEBPB,SNAI2,CEBPA,UBIP1,CEBPG,CEBPD,ZFX,AP2D,PAX5.S,SNAI1,ZEB1,SP4,MBD2,IRF1,MECP2,PAX5.D,SP3,NFIA.C,SP1.A,IRF7,MYF6,NRF1,DBP,MAZ,NKX28,DLX2,GATA1,P53,ZN143,AIRE,NR2C2,HMGA1,FUBP1,TEAD3,OVOL1,HXD4,KLF1,RXRG,HNF1B,ZIC3,HNF1A,NANOG.S,GFI1,PO3F1,NR2C1,ELF5,TF65.C,NFAC3,TEAD1",
+    "dir_scripts": "../../../src/R",
+    "RNASeqIntegration": true,
+    "debugMode": false
+  },
+  "samples": {
+    "summaryFile": "sampleData.tsv",
+    "pairedEnd": true
+  },
+  "peaks": {
+    "consensusPeaks": "",
+    "peakType": "narrow",
+    "minOverlap": 2
+  },
+  "additionalInputFiles": {
+    "refGenome_fasta": "referenceGenome/mm10.fa",
+    "dir_TFBS": "mm10/PWMScan_HOCOMOCOv10",
+    "RNASeqCounts": "data/RNA-Seq/RNA.counts.tsv",
+    "HOCOMOCO_mapping": "../../../src/TF_Gene_TranslationTables/HOCOMOCO_v10/translationTable_mm10.csv"
+  }
+}
